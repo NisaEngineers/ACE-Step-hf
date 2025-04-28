@@ -22,6 +22,12 @@ from models.ace_step_transformer import ACEStepTransformer2DModel
 from models.lyrics_utils.lyric_tokenizer import VoiceBpeTokenizer
 from apg_guidance import apg_forward, MomentumBuffer, cfg_forward, cfg_zero_star, cfg_double_condition_forward
 import torchaudio
+torch.backends.cudnn.benchmark = False
+torch.set_float32_matmul_precision('high')
+
+# Enable TF32 for faster training on Ampere GPUs,
+# cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+torch.backends.cuda.matmul.allow_tf32 = True
 
 
 SUPPORT_LANGUAGES = {
