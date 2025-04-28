@@ -2,17 +2,14 @@ import random
 import time
 import os
 import re
-import glob
 
 import torch
-import torch.nn as nn
 from loguru import logger
 from tqdm import tqdm
 import json
 import math
 from huggingface_hub import hf_hub_download
 
-# from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from schedulers.scheduling_flow_match_heun_discrete import FlowMatchHeunDiscreteScheduler
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import retrieve_timesteps
@@ -64,12 +61,12 @@ class ACEStepPipeline:
 
     def load_checkpoint(self, checkpoint_dir=None):
         device = self.device
-        
+
         dcae_model_path = os.path.join(checkpoint_dir, "music_dcae_f8c8")
         vocoder_model_path = os.path.join(checkpoint_dir, "music_vocoder")
         ace_step_model_path = os.path.join(checkpoint_dir, "ace_step_transformer")
         text_encoder_model_path = os.path.join(checkpoint_dir, "umt5-base")
-        
+
         files_exist = (
             os.path.exists(os.path.join(dcae_model_path, "config.json")) and
             os.path.exists(os.path.join(dcae_model_path, "diffusion_pytorch_model.safetensors")) and
@@ -154,9 +151,9 @@ class ACEStepPipeline:
         self.loaded = True
 
         # compile
-        # self.music_dcae = torch.compile(self.music_dcae)
-        # self.ace_step_transformer = torch.compile(self.ace_step_transformer)
-        # self.text_encoder_model = torch.compile(self.text_encoder_model)
+        self.music_dcae = torch.compile(self.music_dcae)
+        self.ace_step_transformer = torch.compile(self.ace_step_transformer)
+        self.text_encoder_model = torch.compile(self.text_encoder_model)
 
     def get_text_embeddings(self, texts, device, text_max_length=256):
         inputs = self.text_tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=text_max_length)
@@ -223,7 +220,7 @@ class ACEStepPipeline:
 
     def get_lang(self, text):
         language = "en"
-        try:    
+        try: 
             _ = self.lang_segment.getTexts(text)
             langCounts = self.lang_segment.getCounts()
             language = langCounts[0][0]
@@ -341,10 +338,10 @@ class ACEStepPipeline:
             retake_latents = randn_tensor(shape=(bsz, 8, 16, frame_length), generator=retake_random_generators, device=device, dtype=dtype)
             # to make sure mean = 0, std = 1
             target_latents = torch.cos(retake_variance) * target_latents + torch.sin(retake_variance) * retake_latents
-        
+
         attention_mask = torch.ones(bsz, frame_length, device=device, dtype=dtype)
-        
-        # guidance interval逻辑
+
+        # guidance interval
         start_idx = int(num_inference_steps * ((1 - guidance_interval) / 2))
         end_idx = int(num_inference_steps * (guidance_interval / 2 + 0.5))
         logger.info(f"start_idx: {start_idx}, end_idx: {end_idx}, num_inference_steps: {num_inference_steps}")
@@ -353,20 +350,20 @@ class ACEStepPipeline:
 
         def forward_encoder_with_temperature(self, inputs, tau=0.01, l_min=4, l_max=6):
             handlers = []
-            
+
             def hook(module, input, output):
                 output[:] *= tau
                 return output
-            
+
             for i in range(l_min, l_max):
                 handler = self.ace_step_transformer.lyric_encoder.encoders[i].self_attn.linear_q.register_forward_hook(hook)
                 handlers.append(handler)
-        
+
             encoder_hidden_states, encoder_hidden_mask = self.ace_step_transformer.encode(**inputs)
-            
+
             for hook in handlers:
                 hook.remove()
-            
+
             return encoder_hidden_states
 
         # P(speaker, text, lyric)
@@ -399,7 +396,7 @@ class ACEStepPipeline:
                 torch.zeros_like(lyric_token_ids),
                 lyric_mask,
             )
-        
+
         encoder_hidden_states_no_lyric = None
         if do_double_condition_guidance:
             # P(null_speaker, text, lyric_weaker)
@@ -426,11 +423,11 @@ class ACEStepPipeline:
 
         def forward_diffusion_with_temperature(self, hidden_states, timestep, inputs, tau=0.01, l_min=15, l_max=20):
             handlers = []
-            
+
             def hook(module, input, output):
                 output[:] *= tau
                 return output
-            
+
             for i in range(l_min, l_max):
                 handler = self.ace_step_transformer.transformer_blocks[i].attn.to_q.register_forward_hook(hook)
                 handlers.append(handler)
@@ -438,13 +435,12 @@ class ACEStepPipeline:
                 handlers.append(handler)
 
             sample = self.ace_step_transformer.decode(hidden_states=hidden_states, timestep=timestep, **inputs).sample
-            
+
             for hook in handlers:
                 hook.remove()
-            
+
             return sample
 
-    
         for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
             # expand the latents if we are doing classifier free guidance
             latents = target_latents
@@ -549,7 +545,7 @@ class ACEStepPipeline:
                 ).sample
 
             target_latents = scheduler.step(model_output=noise_pred, timestep=t, sample=target_latents, return_dict=False, omega=omega_scale)[0]
-        
+
         return target_latents
 
     def latents2audio(self, latents, target_wav_duration_second=30, sample_rate=48000, save_path=None, format="flac"):
@@ -624,7 +620,7 @@ class ACEStepPipeline:
             oss_steps = list(map(int, oss_steps.split(",")))
         else:
             oss_steps = []
-        
+
         texts = [prompt]
         encoder_text_hidden_states, text_attention_mask = self.get_text_embeddings(texts, self.device)
         encoder_text_hidden_states = encoder_text_hidden_states.repeat(batch_size, 1, 1)
