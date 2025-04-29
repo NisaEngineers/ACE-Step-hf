@@ -24,7 +24,8 @@ def main(args):
     model_demo = ACEStepPipeline(
         checkpoint_dir=args.checkpoint_path,
         dtype="bfloat16" if args.bf16 else "float32",
-        persistent_storage_path=persistent_storage_path
+        persistent_storage_path=persistent_storage_path,
+        torch_compile=True
     )
     data_sampler = DataSampler()
 

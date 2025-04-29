@@ -139,7 +139,7 @@ def create_text2music_ui(
                 )
             with gr.Tab("repainting"):
                 retake_variance = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.2, label="variance")
-                retake_seeds = gr.Textbox(label="retake seeds (default None)", placeholder="", value=None)
+                retake_seeds = gr.Textbox(label="repaint seeds (default None)", placeholder="", value=None)
                 repaint_start = gr.Slider(minimum=0.0, maximum=240.0, step=0.01, value=0.0, label="Repaint Start Time", interactive=True)
                 repaint_end = gr.Slider(minimum=0.0, maximum=240.0, step=0.01, value=30.0, label="Repaint End Time", interactive=True)
                 repaint_source = gr.Radio(["text2music", "last_repaint", "upload"], value="text2music", label="Repaint Source", elem_id="repaint_source")
