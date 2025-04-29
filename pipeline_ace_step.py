@@ -4,6 +4,7 @@ import os
 import re
 
 import torch
+import torch.nn as nn
 from loguru import logger
 from tqdm import tqdm
 import json
@@ -22,11 +23,11 @@ from models.ace_step_transformer import ACEStepTransformer2DModel
 from models.lyrics_utils.lyric_tokenizer import VoiceBpeTokenizer
 from apg_guidance import apg_forward, MomentumBuffer, cfg_forward, cfg_zero_star, cfg_double_condition_forward
 import torchaudio
+
+
 torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision('high')
-
-# Enable TF32 for faster training on Ampere GPUs,
-# cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+torch.backends.cudnn.deterministic = True
 torch.backends.cuda.matmul.allow_tf32 = True
 
 
@@ -49,9 +50,10 @@ def ensure_directory_exists(directory):
 REPO_ID = "ACE-Step/ACE-Step-v1-3.5B"
 
 
+# class ACEStepPipeline(DiffusionPipeline):
 class ACEStepPipeline:
 
-    def __init__(self, checkpoint_dir=None, device_id=0, dtype="bfloat16", text_encoder_checkpoint_path=None, persistent_storage_path=None, **kwargs):
+    def __init__(self, checkpoint_dir=None, device_id=0, dtype="bfloat16", text_encoder_checkpoint_path=None, persistent_storage_path=None, torch_compile=False, **kwargs):
         if checkpoint_dir is None:
             if persistent_storage_path is None:
                 checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
@@ -64,6 +66,7 @@ class ACEStepPipeline:
         self.dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float32
         self.device = device
         self.loaded = False
+        self.torch_compile = torch_compile
 
     def load_checkpoint(self, checkpoint_dir=None):
         device = self.device
@@ -157,9 +160,10 @@ class ACEStepPipeline:
         self.loaded = True
 
         # compile
-        self.music_dcae = torch.compile(self.music_dcae)
-        self.ace_step_transformer = torch.compile(self.ace_step_transformer)
-        self.text_encoder_model = torch.compile(self.text_encoder_model)
+        if self.torch_compile:
+            self.music_dcae = torch.compile(self.music_dcae)
+            self.ace_step_transformer = torch.compile(self.ace_step_transformer)
+            self.text_encoder_model = torch.compile(self.text_encoder_model)
 
     def get_text_embeddings(self, texts, device, text_max_length=256):
         inputs = self.text_tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=text_max_length)
@@ -226,7 +230,7 @@ class ACEStepPipeline:
 
     def get_lang(self, text):
         language = "en"
-        try: 
+        try:
             _ = self.lang_segment.getTexts(text)
             langCounts = self.lang_segment.getCounts()
             language = langCounts[0][0]
@@ -267,6 +271,250 @@ class ACEStepPipeline:
                 print("tokenize error", e, "for line", line, "major_language", lang)
         return lyric_token_idx
 
+    def calc_v(
+        self,
+        zt_src,
+        zt_tar,
+        t,
+        encoder_text_hidden_states,
+        text_attention_mask,
+        target_encoder_text_hidden_states,
+        target_text_attention_mask,
+        speaker_embds,
+        target_speaker_embeds,
+        lyric_token_ids,
+        lyric_mask,
+        target_lyric_token_ids,
+        target_lyric_mask,
+        do_classifier_free_guidance=False,
+        guidance_scale=1.0,
+        target_guidance_scale=1.0,
+        cfg_type="apg",
+        attention_mask=None,
+        momentum_buffer=None,
+        momentum_buffer_tar=None,
+        return_src_pred=True
+    ):
+        noise_pred_src = None
+        if return_src_pred:
+            src_latent_model_input = torch.cat([zt_src, zt_src]) if do_classifier_free_guidance else zt_src
+            timestep = t.expand(src_latent_model_input.shape[0])
+            # source
+            noise_pred_src = self.ace_step_transformer(
+                hidden_states=src_latent_model_input,
+                attention_mask=attention_mask,
+                encoder_text_hidden_states=encoder_text_hidden_states,
+                text_attention_mask=text_attention_mask,
+                speaker_embeds=speaker_embds,
+                lyric_token_idx=lyric_token_ids,
+                lyric_mask=lyric_mask,
+                timestep=timestep,
+            ).sample
+
+            if do_classifier_free_guidance:
+                noise_pred_with_cond_src, noise_pred_uncond_src = noise_pred_src.chunk(2)
+                if cfg_type == "apg":
+                    noise_pred_src = apg_forward(
+                        pred_cond=noise_pred_with_cond_src,
+                        pred_uncond=noise_pred_uncond_src,
+                        guidance_scale=guidance_scale,
+                        momentum_buffer=momentum_buffer,
+                    )
+                elif cfg_type == "cfg":
+                    noise_pred_src = cfg_forward(
+                        cond_output=noise_pred_with_cond_src,
+                        uncond_output=noise_pred_uncond_src,
+                        cfg_strength=guidance_scale,
+                    )
+
+        tar_latent_model_input = torch.cat([zt_tar, zt_tar]) if do_classifier_free_guidance else zt_tar
+        timestep = t.expand(tar_latent_model_input.shape[0])
+        # target
+        noise_pred_tar = self.ace_step_transformer(
+            hidden_states=tar_latent_model_input,
+            attention_mask=attention_mask,
+            encoder_text_hidden_states=target_encoder_text_hidden_states,
+            text_attention_mask=target_text_attention_mask,
+            speaker_embeds=target_speaker_embeds,
+            lyric_token_idx=target_lyric_token_ids,
+            lyric_mask=target_lyric_mask,
+            timestep=timestep,
+        ).sample
+
+        if do_classifier_free_guidance:
+            noise_pred_with_cond_tar, noise_pred_uncond_tar = noise_pred_tar.chunk(2)
+            if cfg_type == "apg":
+                noise_pred_tar = apg_forward(
+                    pred_cond=noise_pred_with_cond_tar,
+                    pred_uncond=noise_pred_uncond_tar,
+                    guidance_scale=target_guidance_scale,
+                    momentum_buffer=momentum_buffer_tar,
+                )
+            elif cfg_type == "cfg":
+                noise_pred_tar = cfg_forward(
+                    cond_output=noise_pred_with_cond_tar,
+                    uncond_output=noise_pred_uncond_tar,
+                    cfg_strength=target_guidance_scale,
+                )
+        return noise_pred_src, noise_pred_tar
+
+    @torch.no_grad()
+    def flowedit_diffusion_process(
+        self,
+        encoder_text_hidden_states,
+        text_attention_mask,
+        speaker_embds,
+        lyric_token_ids,
+        lyric_mask,
+        target_encoder_text_hidden_states,
+        target_text_attention_mask,
+        target_speaker_embeds,
+        target_lyric_token_ids,
+        target_lyric_mask,
+        src_latents,
+        random_generators=None,
+        infer_steps=60,
+        guidance_scale=15.0,
+        n_min=0,
+        n_max=1.0,
+        n_avg=1,
+    ):
+
+        do_classifier_free_guidance = True
+        if guidance_scale == 0.0 or guidance_scale == 1.0:
+            do_classifier_free_guidance = False
+
+        target_guidance_scale = guidance_scale
+        device = encoder_text_hidden_states.device
+        dtype = encoder_text_hidden_states.dtype
+        bsz = encoder_text_hidden_states.shape[0]
+
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=1000,
+            shift=3.0,
+        )
+
+        T_steps = infer_steps
+        frame_length = src_latents.shape[-1]
+        attention_mask = torch.ones(bsz, frame_length, device=device, dtype=dtype)
+        
+        timesteps, T_steps = retrieve_timesteps(scheduler, T_steps, device, timesteps=None)
+
+        if do_classifier_free_guidance:
+            attention_mask = torch.cat([attention_mask] * 2, dim=0)
+            
+            encoder_text_hidden_states = torch.cat([encoder_text_hidden_states, torch.zeros_like(encoder_text_hidden_states)], 0)
+            text_attention_mask = torch.cat([text_attention_mask] * 2, dim=0)
+
+            target_encoder_text_hidden_states = torch.cat([target_encoder_text_hidden_states, torch.zeros_like(target_encoder_text_hidden_states)], 0)
+            target_text_attention_mask = torch.cat([target_text_attention_mask] * 2, dim=0)
+
+            speaker_embds = torch.cat([speaker_embds, torch.zeros_like(speaker_embds)], 0)
+            target_speaker_embeds = torch.cat([target_speaker_embeds, torch.zeros_like(target_speaker_embeds)], 0)
+
+            lyric_token_ids = torch.cat([lyric_token_ids, torch.zeros_like(lyric_token_ids)], 0)
+            lyric_mask = torch.cat([lyric_mask, torch.zeros_like(lyric_mask)], 0)
+
+            target_lyric_token_ids = torch.cat([target_lyric_token_ids, torch.zeros_like(target_lyric_token_ids)], 0)
+            target_lyric_mask = torch.cat([target_lyric_mask, torch.zeros_like(target_lyric_mask)], 0)
+
+        momentum_buffer = MomentumBuffer()
+        momentum_buffer_tar = MomentumBuffer()
+        x_src = src_latents
+        zt_edit = x_src.clone()
+        xt_tar = None
+        n_min = int(infer_steps * n_min)
+        n_max = int(infer_steps * n_max)
+
+        logger.info("flowedit start from {} to {}".format(n_min, n_max))
+
+        for i, t in tqdm(enumerate(timesteps), total=T_steps):
+
+            if i < n_min:
+                continue
+
+            t_i = t/1000
+
+            if i+1 < len(timesteps): 
+                t_im1 = (timesteps[i+1])/1000
+            else:
+                t_im1 = torch.zeros_like(t_i).to(t_i.device)
+
+            if i < n_max:
+                # Calculate the average of the V predictions
+                V_delta_avg = torch.zeros_like(x_src)
+                for k in range(n_avg):
+                    fwd_noise = randn_tensor(shape=x_src.shape, generator=random_generators, device=device, dtype=dtype)
+
+                    zt_src = (1 - t_i) * x_src + (t_i) * fwd_noise
+
+                    zt_tar = zt_edit + zt_src - x_src
+
+                    Vt_src, Vt_tar = self.calc_v(
+                        zt_src=zt_src,
+                        zt_tar=zt_tar,
+                        t=t,
+                        encoder_text_hidden_states=encoder_text_hidden_states,
+                        text_attention_mask=text_attention_mask,
+                        target_encoder_text_hidden_states=target_encoder_text_hidden_states,
+                        target_text_attention_mask=target_text_attention_mask,
+                        speaker_embds=speaker_embds,
+                        target_speaker_embeds=target_speaker_embeds,
+                        lyric_token_ids=lyric_token_ids,
+                        lyric_mask=lyric_mask,
+                        target_lyric_token_ids=target_lyric_token_ids,
+                        target_lyric_mask=target_lyric_mask,
+                        do_classifier_free_guidance=do_classifier_free_guidance,
+                        guidance_scale=guidance_scale,
+                        target_guidance_scale=target_guidance_scale,
+                        attention_mask=attention_mask,
+                        momentum_buffer=momentum_buffer
+                    )
+                    V_delta_avg += (1 / n_avg) * (Vt_tar - Vt_src) # - (hfg-1)*( x_src))
+
+                # propagate direct ODE
+                zt_edit = zt_edit.to(torch.float32)
+                zt_edit = zt_edit + (t_im1 - t_i) * V_delta_avg
+                zt_edit = zt_edit.to(V_delta_avg.dtype)
+            else: # i >= T_steps-n_min # regular sampling for last n_min steps
+                if i == n_max:
+                    fwd_noise = randn_tensor(shape=x_src.shape, generator=random_generators, device=device, dtype=dtype)
+                    scheduler._init_step_index(t)
+                    sigma = scheduler.sigmas[scheduler.step_index]
+                    xt_src = sigma * fwd_noise + (1.0 - sigma) * x_src
+                    xt_tar = zt_edit + xt_src - x_src
+                
+                _, Vt_tar = self.calc_v(
+                    zt_src=None,
+                    zt_tar=xt_tar,
+                    t=t,
+                    encoder_text_hidden_states=encoder_text_hidden_states,
+                    text_attention_mask=text_attention_mask,
+                    target_encoder_text_hidden_states=target_encoder_text_hidden_states,
+                    target_text_attention_mask=target_text_attention_mask,
+                    speaker_embds=speaker_embds,
+                    target_speaker_embeds=target_speaker_embeds,
+                    lyric_token_ids=lyric_token_ids,
+                    lyric_mask=lyric_mask,
+                    target_lyric_token_ids=target_lyric_token_ids,
+                    target_lyric_mask=target_lyric_mask,
+                    do_classifier_free_guidance=do_classifier_free_guidance,
+                    guidance_scale=guidance_scale,
+                    target_guidance_scale=target_guidance_scale,
+                    attention_mask=attention_mask,
+                    momentum_buffer_tar=momentum_buffer_tar,
+                    return_src_pred=False,
+                )
+                
+                dtype = Vt_tar.dtype
+                xt_tar = xt_tar.to(torch.float32)
+                prev_sample = xt_tar + (t_im1 - t_i) * Vt_tar
+                prev_sample = prev_sample.to(dtype) 
+                xt_tar = prev_sample
+        
+        target_latents = zt_edit if xt_tar is None else xt_tar
+        return target_latents
+
     @torch.no_grad()
     def text2music_diffusion_process(
         self,
@@ -296,13 +544,16 @@ class ACEStepPipeline:
         add_retake_noise=False,
         guidance_scale_text=0.0,
         guidance_scale_lyric=0.0,
+        repaint_start=0,
+        repaint_end=0,
+        src_latents=None,
     ):
 
         logger.info("cfg_type: {}, guidance_scale: {}, omega_scale: {}".format(cfg_type, guidance_scale, omega_scale))
         do_classifier_free_guidance = True
         if guidance_scale == 0.0 or guidance_scale == 1.0:
             do_classifier_free_guidance = False
-
+        
         do_double_condition_guidance = False
         if guidance_scale_text is not None and guidance_scale_text > 1.0 and guidance_scale_lyric is not None and guidance_scale_lyric > 1.0:
             do_double_condition_guidance = True
@@ -322,7 +573,10 @@ class ACEStepPipeline:
                 num_train_timesteps=1000,
                 shift=3.0,
             )
+        
         frame_length = int(duration * 44100 / 512 / 8)
+        if src_latents is not None:
+            frame_length = src_latents.shape[-1]
 
         if len(oss_steps) > 0:
             infer_steps = max(oss_steps)
@@ -337,16 +591,30 @@ class ACEStepPipeline:
             logger.info(f"oss_steps: {oss_steps}, num_inference_steps: {num_inference_steps} after remapping to timesteps {timesteps}")
         else:
             timesteps, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps=infer_steps, device=device, timesteps=None)
-
+        
         target_latents = randn_tensor(shape=(bsz, 8, 16, frame_length), generator=random_generators, device=device, dtype=dtype)
+        
+        is_repaint = False
         if add_retake_noise:
             retake_variance = torch.tensor(retake_variance * math.pi/2).to(device).to(dtype)
             retake_latents = randn_tensor(shape=(bsz, 8, 16, frame_length), generator=retake_random_generators, device=device, dtype=dtype)
+            repaint_start_frame = int(repaint_start * 44100 / 512 / 8)
+            repaint_end_frame = int(repaint_end * 44100 / 512 / 8)
+
+            # retake
+            is_repaint = repaint_end_frame - repaint_start_frame != frame_length
             # to make sure mean = 0, std = 1
-            target_latents = torch.cos(retake_variance) * target_latents + torch.sin(retake_variance) * retake_latents
+            if not is_repaint:
+                target_latents = torch.cos(retake_variance) * target_latents + torch.sin(retake_variance) * retake_latents
+            else:
+                repaint_mask = torch.zeros((bsz, 8, 16, frame_length), device=device, dtype=dtype)
+                repaint_mask[:, :, :, repaint_start_frame:repaint_end_frame] = 1.0
+                repaint_noise = torch.cos(retake_variance) * target_latents + torch.sin(retake_variance) * retake_latents
+                repaint_noise = torch.where(repaint_mask == 1.0, repaint_noise, target_latents)
+                z0 = repaint_noise
 
         attention_mask = torch.ones(bsz, frame_length, device=device, dtype=dtype)
-
+        
         # guidance interval
         start_idx = int(num_inference_steps * ((1 - guidance_interval) / 2))
         end_idx = int(num_inference_steps * (guidance_interval / 2 + 0.5))
@@ -356,20 +624,20 @@ class ACEStepPipeline:
 
         def forward_encoder_with_temperature(self, inputs, tau=0.01, l_min=4, l_max=6):
             handlers = []
-
+            
             def hook(module, input, output):
                 output[:] *= tau
                 return output
-
+            
             for i in range(l_min, l_max):
                 handler = self.ace_step_transformer.lyric_encoder.encoders[i].self_attn.linear_q.register_forward_hook(hook)
                 handlers.append(handler)
-
+        
             encoder_hidden_states, encoder_hidden_mask = self.ace_step_transformer.encode(**inputs)
-
+            
             for hook in handlers:
                 hook.remove()
-
+            
             return encoder_hidden_states
 
         # P(speaker, text, lyric)
@@ -402,7 +670,7 @@ class ACEStepPipeline:
                 torch.zeros_like(lyric_token_ids),
                 lyric_mask,
             )
-
+        
         encoder_hidden_states_no_lyric = None
         if do_double_condition_guidance:
             # P(null_speaker, text, lyric_weaker)
@@ -429,11 +697,11 @@ class ACEStepPipeline:
 
         def forward_diffusion_with_temperature(self, hidden_states, timestep, inputs, tau=0.01, l_min=15, l_max=20):
             handlers = []
-
+            
             def hook(module, input, output):
                 output[:] *= tau
                 return output
-
+            
             for i in range(l_min, l_max):
                 handler = self.ace_step_transformer.transformer_blocks[i].attn.to_q.register_forward_hook(hook)
                 handlers.append(handler)
@@ -441,10 +709,10 @@ class ACEStepPipeline:
                 handlers.append(handler)
 
             sample = self.ace_step_transformer.decode(hidden_states=hidden_states, timestep=timestep, **inputs).sample
-
+            
             for hook in handlers:
                 hook.remove()
-
+            
             return sample
 
         for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
@@ -551,7 +819,13 @@ class ACEStepPipeline:
                 ).sample
 
             target_latents = scheduler.step(model_output=noise_pred, timestep=t, sample=target_latents, return_dict=False, omega=omega_scale)[0]
+            if is_repaint:
+                t_i = t / 1000
+                x0 = src_latents
+                xt = (1 - t_i) * x0 + t_i * z0
+                target_latents = torch.where(repaint_mask == 1.0, target_latents, xt)
 
+        
         return target_latents
 
     def latents2audio(self, latents, target_wav_duration_second=30, sample_rate=48000, save_path=None, format="flac"):
@@ -570,7 +844,7 @@ class ACEStepPipeline:
     def save_wav_file(self, target_wav, idx, save_path=None, sample_rate=48000, format="flac"):
         if save_path is None:
             logger.warning("save_path is None, using default path ./outputs/")
-            base_path = f"./outputs/"
+            base_path = f"./outputs"
             ensure_directory_exists(base_path)
         else:
             base_path = save_path
@@ -580,6 +854,16 @@ class ACEStepPipeline:
         target_wav = target_wav.float()
         torchaudio.save(output_path_flac, target_wav, sample_rate=sample_rate, format=format)
         return output_path_flac
+
+    def infer_latents(self, input_audio_path):
+        if input_audio_path is None:
+            return None
+        input_audio, sr = self.music_dcae.load_audio(input_audio_path)
+        input_audio = input_audio.unsqueeze(0)
+        device, dtype = self.device, self.dtype
+        input_audio = input_audio.to(device=device, dtype=dtype)
+        latents, _ = self.music_dcae.encode(input_audio, sr=sr)
+        return latents
 
     def __call__(
         self,
@@ -604,6 +888,14 @@ class ACEStepPipeline:
         retake_seeds: list = None,
         retake_variance: float = 0.5,
         task: str = "text2music",
+        repaint_start: int = 0,
+        repaint_end: int = 0,
+        src_audio_path: str = None,
+        edit_target_prompt: str = None,
+        edit_target_lyrics: str = None,
+        edit_n_min: float = 0.0,
+        edit_n_max: float = 1.0,
+        edit_n_avg: int = 1,
         save_path: str = None,
         format: str = "flac",
         batch_size: int = 1,
@@ -626,7 +918,7 @@ class ACEStepPipeline:
             oss_steps = list(map(int, oss_steps.split(",")))
         else:
             oss_steps = []
-
+        
         texts = [prompt]
         encoder_text_hidden_states, text_attention_mask = self.get_text_embeddings(texts, self.device)
         encoder_text_hidden_states = encoder_text_hidden_states.repeat(batch_size, 1, 1)
@@ -657,32 +949,83 @@ class ACEStepPipeline:
         preprocess_time_cost = end_time - start_time
         start_time = end_time
 
-        target_latents = self.text2music_diffusion_process(
-            duration=audio_duration,
-            encoder_text_hidden_states=encoder_text_hidden_states,
-            text_attention_mask=text_attention_mask,
-            speaker_embds=speaker_embeds,
-            lyric_token_ids=lyric_token_idx,
-            lyric_mask=lyric_mask,
-            guidance_scale=guidance_scale,
-            omega_scale=omega_scale,
-            infer_steps=infer_step,
-            random_generators=random_generators,
-            scheduler_type=scheduler_type,
-            cfg_type=cfg_type,
-            guidance_interval=guidance_interval,
-            guidance_interval_decay=guidance_interval_decay,
-            min_guidance_scale=min_guidance_scale,
-            oss_steps=oss_steps,
-            encoder_text_hidden_states_null=encoder_text_hidden_states_null,
-            use_erg_lyric=use_erg_lyric,
-            use_erg_diffusion=use_erg_diffusion,
-            retake_random_generators=retake_random_generators,
-            retake_variance=retake_variance,
-            add_retake_noise=task == "retake",
-            guidance_scale_text=guidance_scale_text,
-            guidance_scale_lyric=guidance_scale_lyric,
-        )
+        add_retake_noise = task in ("retake", "repaint")
+        # retake equal to repaint
+        if task == "retake":
+            repaint_start = 0
+            repaint_end = audio_duration
+        
+        src_latents = None
+        if src_audio_path is not None:
+            assert src_audio_path is not None and task in ("repaint", "edit"), "src_audio_path is required for repaint task"
+            assert os.path.exists(src_audio_path), f"src_audio_path {src_audio_path} does not exist"
+            src_latents = self.infer_latents(src_audio_path)
+
+        if task == "edit":
+            texts = [edit_target_prompt]
+            target_encoder_text_hidden_states, target_text_attention_mask = self.get_text_embeddings(texts, self.device)
+            target_encoder_text_hidden_states = target_encoder_text_hidden_states.repeat(batch_size, 1, 1)
+            target_text_attention_mask = target_text_attention_mask.repeat(batch_size, 1)
+
+            target_lyric_token_idx = torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
+            target_lyric_mask = torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
+            if len(edit_target_lyrics) > 0:
+                target_lyric_token_idx = self.tokenize_lyrics(edit_target_lyrics, debug=True)
+                target_lyric_mask = [1] * len(target_lyric_token_idx)
+                target_lyric_token_idx = torch.tensor(target_lyric_token_idx).unsqueeze(0).to(self.device).repeat(batch_size, 1)
+                target_lyric_mask = torch.tensor(target_lyric_mask).unsqueeze(0).to(self.device).repeat(batch_size, 1)
+
+            target_speaker_embeds = speaker_embeds.clone()
+
+            target_latents = self.flowedit_diffusion_process(
+                encoder_text_hidden_states=encoder_text_hidden_states,
+                text_attention_mask=text_attention_mask,
+                speaker_embds=speaker_embeds,
+                lyric_token_ids=lyric_token_idx,
+                lyric_mask=lyric_mask,
+                target_encoder_text_hidden_states=target_encoder_text_hidden_states,
+                target_text_attention_mask=target_text_attention_mask,
+                target_speaker_embeds=target_speaker_embeds,
+                target_lyric_token_ids=target_lyric_token_idx,
+                target_lyric_mask=target_lyric_mask,
+                src_latents=src_latents,
+                random_generators=random_generators,
+                infer_steps=infer_step,
+                guidance_scale=guidance_scale,
+                n_min=edit_n_min,
+                n_max=edit_n_max,
+                n_avg=edit_n_avg,
+            )
+        else:
+            target_latents = self.text2music_diffusion_process(
+                duration=audio_duration,
+                encoder_text_hidden_states=encoder_text_hidden_states,
+                text_attention_mask=text_attention_mask,
+                speaker_embds=speaker_embeds,
+                lyric_token_ids=lyric_token_idx,
+                lyric_mask=lyric_mask,
+                guidance_scale=guidance_scale,
+                omega_scale=omega_scale,
+                infer_steps=infer_step,
+                random_generators=random_generators,
+                scheduler_type=scheduler_type,
+                cfg_type=cfg_type,
+                guidance_interval=guidance_interval,
+                guidance_interval_decay=guidance_interval_decay,
+                min_guidance_scale=min_guidance_scale,
+                oss_steps=oss_steps,
+                encoder_text_hidden_states_null=encoder_text_hidden_states_null,
+                use_erg_lyric=use_erg_lyric,
+                use_erg_diffusion=use_erg_diffusion,
+                retake_random_generators=retake_random_generators,
+                retake_variance=retake_variance,
+                add_retake_noise=add_retake_noise,
+                guidance_scale_text=guidance_scale_text,
+                guidance_scale_lyric=guidance_scale_lyric,
+                repaint_start=repaint_start,
+                repaint_end=repaint_end,
+                src_latents=src_latents,
+            )
 
         end_time = time.time()
         diffusion_time_cost = end_time - start_time
@@ -726,6 +1069,14 @@ class ACEStepPipeline:
             "retake_variance": retake_variance,
             "guidance_scale_text": guidance_scale_text,
             "guidance_scale_lyric": guidance_scale_lyric,
+            "repaint_start": repaint_start,
+            "repaint_end": repaint_end,
+            "edit_n_min": edit_n_min,
+            "edit_n_max": edit_n_max,
+            "edit_n_avg": edit_n_avg,        
+            "src_audio_path": src_audio_path,
+            "edit_target_prompt": edit_target_prompt,
+            "edit_target_lyrics": edit_target_lyrics,
         }
         # save input_params_json
         for output_audio_path in output_paths:
