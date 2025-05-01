@@ -65,7 +65,7 @@ def create_text2music_ui(
         with gr.Column():
             with gr.Row(equal_height=True):
                 # add markdown, tags and lyrics examples are from ai music generation community
-                audio_duration = gr.Slider(-1, 240.0, step=0.00001, value=180, label="Audio Duration", interactive=True, info="-1 means random duration (30 ~ 240).", scale=9)
+                audio_duration = gr.Slider(-1, 240.0, step=0.00001, value=-1, label="Audio Duration", interactive=True, info="-1 means random duration (30 ~ 240).", scale=9)
                 sample_bnt = gr.Button("Sample", variant="primary", scale=1)
             
             prompt = gr.Textbox(lines=2, label="Tags", max_lines=4, placeholder=TAG_PLACEHOLDER, info="Support tags, descriptions, and scene. Use commas to separate different tags.\ntags and lyrics examples are from ai music generation community")
@@ -252,14 +252,15 @@ def create_text2music_ui(
             with gr.Tab("edit"):
                 edit_prompt = gr.Textbox(lines=2, label="Edit Tags", max_lines=4)
                 edit_lyrics = gr.Textbox(lines=9, label="Edit Lyrics", max_lines=13)
-
+                retake_seeds = gr.Textbox(label="edit seeds (default None)", placeholder="", value=None)
+                
                 edit_type = gr.Radio(["only_lyrics", "remix"], value="only_lyrics", label="Edit Type", elem_id="edit_type", info="`only_lyrics` will keep the whole song the same except lyrics difference. Make your diffrence smaller, e.g. one lyrc line change.\nremix can change the song melody and genre")
-                edit_n_min = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.8, label="edit_n_min", interactive=True)
+                edit_n_min = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.6, label="edit_n_min", interactive=True)
                 edit_n_max = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=1.0, label="edit_n_max", interactive=True)
                 
                 def edit_type_change_func(edit_type):
                     if edit_type == "only_lyrics":
-                        n_min = 0.8
+                        n_min = 0.6
                         n_max = 1.0
                     elif edit_type == "remix":
                         n_min = 0.2
@@ -309,6 +310,7 @@ def create_text2music_ui(
                     oss_steps,
                     guidance_scale_text,
                     guidance_scale_lyric,
+                    retake_seeds,
                 ):
                     if edit_source == "upload":
                         src_audio_path = edit_source_audio_upload
@@ -349,7 +351,8 @@ def create_text2music_ui(
                         edit_target_prompt=edit_prompt,
                         edit_target_lyrics=edit_lyrics,
                         edit_n_min=edit_n_min,
-                        edit_n_max=edit_n_max
+                        edit_n_max=edit_n_max,
+                        retake_seeds=retake_seeds,
                     )
                 
                 edit_bnt.click(
@@ -380,8 +383,120 @@ def create_text2music_ui(
                         oss_steps,
                         guidance_scale_text,
                         guidance_scale_lyric,
+                        retake_seeds,
                     ],
                     outputs=edit_outputs + [edit_input_params_json],
+                )
+            with gr.Tab("extend"):
+                extend_seeds = gr.Textbox(label="extend seeds (default None)", placeholder="", value=None)
+                left_extend_length = gr.Slider(minimum=0.0, maximum=240.0, step=0.01, value=0.0, label="Left Extend Length", interactive=True)
+                right_extend_length = gr.Slider(minimum=0.0, maximum=240.0, step=0.01, value=30.0, label="Right Extend Length", interactive=True)
+                extend_source = gr.Radio(["text2music", "last_extend", "upload"], value="text2music", label="Extend Source", elem_id="extend_source")
+                
+                extend_source_audio_upload = gr.Audio(label="Upload Audio", type="filepath", visible=False, elem_id="extend_source_audio_upload")
+                extend_source.change(
+                    fn=lambda x: gr.update(visible=x == "upload", elem_id="extend_source_audio_upload"),
+                    inputs=[extend_source],
+                    outputs=[extend_source_audio_upload],
+                )
+
+                extend_bnt = gr.Button("Extend", variant="primary")
+                extend_outputs, extend_input_params_json = create_output_ui("Extend")
+                
+                def extend_process_func(
+                    text2music_json_data,
+                    extend_input_params_json,
+                    extend_seeds,
+                    left_extend_length,
+                    right_extend_length,
+                    extend_source,
+                    extend_source_audio_upload,
+                    prompt,
+                    lyrics,
+                    infer_step,
+                    guidance_scale,
+                    scheduler_type,
+                    cfg_type,
+                    omega_scale,
+                    manual_seeds,
+                    guidance_interval,
+                    guidance_interval_decay,
+                    min_guidance_scale,
+                    use_erg_tag,
+                    use_erg_lyric,
+                    use_erg_diffusion,
+                    oss_steps,
+                    guidance_scale_text,
+                    guidance_scale_lyric,
+                ):
+                    if extend_source == "upload":
+                        src_audio_path = extend_source_audio_upload
+                        json_data = text2music_json_data
+                    elif extend_source == "text2music":
+                        json_data = text2music_json_data
+                        src_audio_path = json_data["audio_path"]
+                    elif extend_source == "last_repaint":
+                        json_data = extend_input_params_json
+                        src_audio_path = json_data["audio_path"]
+
+                    repaint_start = -left_extend_length
+                    repaint_end = json_data["audio_duration"] + right_extend_length
+                    return text2music_process_func(
+                        json_data["audio_duration"],
+                        prompt,
+                        lyrics,
+                        infer_step,
+                        guidance_scale,
+                        scheduler_type,
+                        cfg_type,
+                        omega_scale,
+                        manual_seeds,
+                        guidance_interval,
+                        guidance_interval_decay,
+                        min_guidance_scale,
+                        use_erg_tag,
+                        use_erg_lyric,
+                        use_erg_diffusion,
+                        oss_steps,
+                        guidance_scale_text,
+                        guidance_scale_lyric,
+                        retake_seeds=extend_seeds,
+                        retake_variance=1.0,
+                        task="extend",
+                        repaint_start=repaint_start,
+                        repaint_end=repaint_end,
+                        src_audio_path=src_audio_path,
+                    )
+                
+                extend_bnt.click(
+                    fn=extend_process_func,
+                    inputs=[
+                        input_params_json,
+                        extend_input_params_json,
+                        extend_seeds,
+                        left_extend_length,
+                        right_extend_length,
+                        extend_source,
+                        extend_source_audio_upload,
+                        prompt,
+                        lyrics,
+                        infer_step,
+                        guidance_scale,
+                        scheduler_type,
+                        cfg_type,
+                        omega_scale,
+                        manual_seeds,
+                        guidance_interval,
+                        guidance_interval_decay,
+                        min_guidance_scale,
+                        use_erg_tag,
+                        use_erg_lyric,
+                        use_erg_diffusion,
+                        oss_steps,
+                        guidance_scale_text,
+                        guidance_scale_lyric,
+                    ],
+                    outputs=extend_outputs + [extend_input_params_json],
                 )
 
         def sample_data():
