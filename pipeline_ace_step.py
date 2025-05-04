@@ -11,6 +11,7 @@ import json
 import math
 from huggingface_hub import hf_hub_download
 
+# from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from schedulers.scheduling_flow_match_heun_discrete import FlowMatchHeunDiscreteScheduler
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import retrieve_timesteps
@@ -29,6 +30,7 @@ torch.backends.cudnn.benchmark = False
 torch.set_float32_matmul_precision('high')
 torch.backends.cudnn.deterministic = True
 torch.backends.cuda.matmul.allow_tf32 = True
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 SUPPORT_LANGUAGES = {
@@ -54,7 +56,7 @@ REPO_ID = "ACE-Step/ACE-Step-v1-3.5B"
 class ACEStepPipeline:
 
     def __init__(self, checkpoint_dir=None, device_id=0, dtype="bfloat16", text_encoder_checkpoint_path=None, persistent_storage_path=None, torch_compile=False, **kwargs):
-        if checkpoint_dir is None:
+        if not checkpoint_dir:
             if persistent_storage_path is None:
                 checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
             else:
@@ -63,7 +65,11 @@ class ACEStepPipeline:
 
         self.checkpoint_dir = checkpoint_dir
         device = torch.device(f"cuda:{device_id}") if torch.cuda.is_available() else torch.device("cpu")
+        if device.type == "cpu" and torch.backends.mps.is_available():
+            device = torch.device("mps")
         self.dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float32
+        if device.type == "mps" and self.dtype == torch.bfloat16:
+            self.dtype = torch.float16
         self.device = device
         self.loaded = False
         self.torch_compile = torch_compile
@@ -620,6 +626,7 @@ class ACEStepPipeline:
                 repaint_mask[:, :, :, repaint_start_frame:repaint_end_frame] = 1.0
                 repaint_noise = torch.cos(retake_variance) * target_latents + torch.sin(retake_variance) * retake_latents
                 repaint_noise = torch.where(repaint_mask == 1.0, repaint_noise, target_latents)
+                zt_edit = x0.clone()
                 z0 = repaint_noise
             elif is_extend:
                 to_right_pad_gt_latents = None
@@ -669,9 +676,8 @@ class ACEStepPipeline:
                     padd_list.append(retake_latents[:, :, :, -right_pad_frame_length:])
                 target_latents = torch.cat(padd_list, dim=-1)
                 assert target_latents.shape[-1] == x0.shape[-1], f"{target_latents.shape=} {x0.shape=}"
-
-            zt_edit = x0.clone()
-            z0 = target_latents
+                zt_edit = x0.clone()
+                z0 = target_latents
 
         attention_mask = torch.ones(bsz, frame_length, device=device, dtype=dtype)
         
@@ -774,7 +780,7 @@ class ACEStepPipeline:
                 hook.remove()
             
             return sample
-
+    
         for i, t in tqdm(enumerate(timesteps), total=num_inference_steps):
             
             if is_repaint:
