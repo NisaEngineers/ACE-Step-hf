@@ -1,3 +1,16 @@
+---
+title: ACE Step
+emoji: 😻
+colorFrom: blue
+colorTo: pink
+sdk: gradio
+sdk_version: 5.27.0
+app_file: app.py
+pinned: false
+---
+
+Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+
 <h1 align="center">✨ ACE-Step ✨</h1>
 <h1 align="center">🎵 A Step Towards Music Generation Foundation Model 🎵</h1>
 <p align="center">
