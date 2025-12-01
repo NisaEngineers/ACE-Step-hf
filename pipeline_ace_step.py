@@ -942,7 +942,7 @@ class ACEStepPipeline:
 
         output_path_flac = f"{base_path}/output_{time.strftime('%Y%m%d%H%M%S')}_{idx}.{format}"
         target_wav = target_wav.float()
-        torchaudio.save(output_path_flac, target_wav, sample_rate=sample_rate, format="FLAC", compression_level=8)
+        torchaudio.save(output_path_flac, target_wav, sample_rate=sample_rate, format="FLAC")
         return output_path_flac
 
     def infer_latents(self, input_audio_path):
